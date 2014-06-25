@@ -612,7 +612,8 @@ static struct json_object *get_pe_property(cli_ctx *ctx)
     if (!(ctx) || !(ctx->wrkproperty))
         return NULL;
 
-    if (!json_object_object_get_ex(ctx->wrkproperty, "PE", &pe)) {
+    pe = json_object_object_get(ctx->wrkproperty, "PE");
+    if (!(pe)) {
         pe = json_object_new_object();
         if (!(pe))
             return NULL;
@@ -633,7 +634,8 @@ static void pe_add_heuristic_property(cli_ctx *ctx, const char *key)
     if (!(pe))
         return;
 
-    if (!json_object_object_get_ex(pe, "Heuristics", &heuristics)) {
+    heuristics = json_object_object_get(pe, "Heuristics");
+    if (!(heuristics)) {
         heuristics = json_object_new_array();
         if (!(heuristics))
             return;
@@ -657,7 +659,8 @@ static struct json_object *get_section_json(cli_ctx *ctx)
     if (!(pe))
         return NULL;
 
-    if (!json_object_object_get_ex(pe, "Sections", &section)) {
+    section = json_object_object_get(pe, "Sections");
+    if (!(section)) {
         section = json_object_new_array();
         if (!(section))
             return NULL;

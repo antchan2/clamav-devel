@@ -226,8 +226,10 @@ json_object *cli_jsonarray(json_object *obj, const char *key)
     json_object *newobj;
 
     /* First check to see if this key exists */
-    if (obj && key && json_object_object_get_ex(obj, key, &newobj)) {
-        return json_object_is_type(newobj, json_type_array) ? newobj : NULL;
+    if (obj && key) {
+        newobj = json_object_object_get(obj, key);
+        if (newobj)
+            return json_object_is_type(newobj, json_type_array) ? newobj : NULL;
     }
 
     newobj = json_object_new_array();
@@ -236,7 +238,8 @@ json_object *cli_jsonarray(json_object *obj, const char *key)
 
     if (obj && key) {
         json_object_object_add(obj, key, newobj);
-        if (!json_object_object_get_ex(obj, key, &newobj))
+        newobj = json_object_object_get(obj, key);
+        if (!newobj)
             return NULL;
     }
 
@@ -265,8 +268,11 @@ json_object *cli_jsonobj(json_object *obj, const char *key)
 {
     json_object *newobj;
 
-    if (obj && key && json_object_object_get_ex(obj, key, &newobj))
-        return json_object_is_type(newobj, json_type_object) ? newobj : NULL;
+    if (obj && key) {
+        newobj = json_object_object_get(obj, key);
+        if (newobj) 
+            return json_object_is_type(newobj, json_type_object) ? newobj : NULL;
+    }
 
     newobj = json_object_new_object();
     if (!(newobj))
@@ -274,7 +280,8 @@ json_object *cli_jsonobj(json_object *obj, const char *key)
 
     if (obj && key) {
         json_object_object_add(obj, key, newobj);
-        if (!json_object_object_get_ex(obj, key, &newobj))
+        newobj = json_object_object_get(obj, key);
+        if (!newobj)
             return NULL;
     }
 
