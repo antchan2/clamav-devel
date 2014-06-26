@@ -710,7 +710,7 @@ ole2_walk_property_tree(ole2_header_t * hdr, const char *dir, int32_t prop_index
             if (dir) {
 #if HAVE_JSON
                 if ((ctx->options & CL_SCAN_FILE_PROPERTIES) && (ctx->wrkproperty != NULL)) {
-                    if (!json_object_object_get(ctx->wrkproperty, "DigitalSignatures")) {
+                    if (!json_object_object_get_ex(ctx->wrkproperty, "DigitalSignatures", NULL)) {
                         name = get_property_name2(prop_block[idx].name, prop_block[idx].name_size);
                         if (name) {
                             if (!strcmp(name, "_xmlsignatures") || !strcmp(name, "_signatures")) {
@@ -914,8 +914,7 @@ handler_enum(ole2_header_t * hdr, property_t * prop, const char *dir, cli_ctx * 
             }
 
             /*
-            arrobj = json_object_object_get(ctx->wrkproperty, "Streams");
-            if (!arrobj) {
+            if (!json_object_object_get_ex(ctx->wrkproperty, "Streams", &arrobj)) {
                 arrobj = json_object_new_array();
                 if (NULL == arrobj) {
                     cli_errmsg("ole2: no memory for streams list as json array\n");

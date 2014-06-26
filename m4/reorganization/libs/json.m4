@@ -58,7 +58,7 @@ then
     CFLAGS="$CFLAGS $JSON_CPPFLAGS"
   fi
 
-  AC_SEARCH_LIBS([json_object_object_get], [json-c json], [have_json="yes"], [have_json="no"])
+  AC_SEARCH_LIBS([json_object_object_get_ex], [json-c json], [have_json="yes"], [have_json="no"])
 
   CFLAGS="$save_CFLAGS"
   LDFLAGS="$save_LDFLAGS"
