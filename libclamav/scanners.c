@@ -44,10 +44,6 @@
 #include <sys/times.h>
 #endif
 
-#include <openssl/ssl.h>
-#include <openssl/err.h>
-#include "libclamav/crypto.h"
-
 #define DCONF_ARCH  ctx->dconf->archive
 #define DCONF_DOC   ctx->dconf->doc
 #define DCONF_MAIL  ctx->dconf->mail
@@ -2591,7 +2587,11 @@ static int magic_scandesc(cli_ctx *ctx, cli_file_t type)
                     early_ret_from_magicscan(CL_EMEM);       
                 }
                 ctx->wrkproperty = ctx->properties;
-                ret = cli_jsonstr(ctx->properties, "Magic", "JSON");
+                ret = cli_jsonstr(ctx->properties, "Magic", "CLAMJSONv0");
+                if (ret != CL_SUCCESS) {
+                    early_ret_from_magicscan(ret);
+                }
+                ret = cli_jsonstr(ctx->properties, "RootFileType", filetype);
                 if (ret != CL_SUCCESS) {
                     early_ret_from_magicscan(ret);
                 }
@@ -3414,8 +3414,23 @@ static int scan_common(int desc, cl_fmap_t *map, const char **virname, unsigned 
 
 #if HAVE_JSON
     if (ctx.options & CL_SCAN_FILE_PROPERTIES && ctx.properties!=NULL) {
+        json_object *jobj;
+        const char *jstring;
+
+        /* set value of unique root object tag */
+        if (json_object_object_get_ex(ctx.properties, "FileType", &jobj)) {
+            enum json_type type;
+            const char *jstr;
+
+            type = json_object_get_type(jobj);
+            if (type == json_type_string) {
+                jstr = json_object_get_string(jobj);
+                cli_jsonstr(ctx.properties, "RootFileType", jstr);
+            }
+        }
+
         /* serialize json properties to string */
-        const char *jstring = json_object_to_json_string(ctx.properties);
+        jstring = json_object_to_json_string(ctx.properties);
         if (NULL == jstring) {
             cli_errmsg("scan_common: no memory for json serialization.\n");
             rc = CL_EMEM;

@@ -35,10 +35,7 @@
 #include <stdlib.h>
 #include "clamav.h"
 
-#include <openssl/ssl.h>
-#include <openssl/err.h>
-#include "libclamav/crypto.h"
-
+#include "clamav.h"
 #include "cltypes.h"
 #include "others.h"
 #include "ole2_extract.h"
@@ -226,7 +223,7 @@ get_property_name2(char *name, int size)
     int             i, j;
     char           *newname;
 
-    if (*name == 0 || size <= 0 || size > 64) {
+    if (*name == 0 || size <= 0 || size > 128) {
         return NULL;
     }
     newname = (char *)cli_malloc(size * 7);
@@ -714,7 +711,7 @@ ole2_walk_property_tree(ole2_header_t * hdr, const char *dir, int32_t prop_index
                         name = get_property_name2(prop_block[idx].name, prop_block[idx].name_size);
                         if (name) {
                             if (!strcmp(name, "_xmlsignatures") || !strcmp(name, "_signatures")) {
-                                cli_jsonbool(ctx->wrkproperty, "DigitalSignatures", 1);
+                                cli_jsonbool(ctx->wrkproperty, "HasDigitalSignatures", 1);
                             }
                             free(name);
                         }
@@ -897,7 +894,7 @@ handler_writefile(ole2_header_t * hdr, property_t * prop, const char *dir, cli_c
 static int
 handler_enum(ole2_header_t * hdr, property_t * prop, const char *dir, cli_ctx * ctx)
 {
-    char           *name;
+    char           *name = NULL;
 #if HAVE_JSON
     json_object *arrobj, *strmobj;
 
@@ -913,19 +910,6 @@ handler_enum(ole2_header_t * hdr, property_t * prop, const char *dir, cli_ctx * 
                 json_object_array_add(arrobj, strmobj);
             }
 
-            /*
-            if (!json_object_object_get_ex(ctx->wrkproperty, "Streams", &arrobj)) {
-                arrobj = json_object_new_array();
-                if (NULL == arrobj) {
-                    cli_errmsg("ole2: no memory for streams list as json array\n");
-                    return CL_EMEM;
-                }
-                json_object_object_add(ctx->wrkproperty, "Streams", arrobj);
-            }
-            strmobj = json_object_new_string(name);
-            json_object_array_add(arrobj, strmobj);
-            */
-
             if (!strcmp(name, "powerpoint document")) {
                 cli_jsonstr(ctx->wrkproperty, "FileType", "CL_TYPE_MSPPT");
             }
@@ -937,24 +921,19 @@ handler_enum(ole2_header_t * hdr, property_t * prop, const char *dir, cli_ctx * 
             }
 
         }
-
-        if (!hdr->has_vba) {
+    }
+#endif
+    if (!hdr->has_vba) {
+        if (!name)
+            name = get_property_name2(prop->name, prop->name_size);
+        if (name) {
             if (!strcmp(name, "_vba_project") || !strcmp(name, "powerpoint document") || !strcmp(name, "worddocument") || !strcmp(name, "_1_ole10native"))
                 hdr->has_vba = 1;
         }
-        free(name);
     }
-#else
-        if (!hdr->has_vba) {
-            name = get_property_name2(prop->name, prop->name_size);
-            if (name) {
-                if (!strcmp(name, "_vba_project") || !strcmp(name, "powerpoint document") || !strcmp(name, "worddocument") || !strcmp(name, "_1_ole10native"))
-                    hdr->has_vba = 1;
-                free(name);
-            }
-        }
-#endif
 
+    if (name)
+        free(name);
     return CL_SUCCESS;
 }
 
@@ -1322,11 +1301,11 @@ abort:
 
 #define WINUNICODE 0x04B0
 #define PROPCNTLIMIT 25
-#define PROPSTRLIMIT 100
+#define PROPSTRLIMIT 62
 
 #define sum16_endian_convert(v) le16_to_host((uint16_t)(v))
 #define sum32_endian_convert(v) le32_to_host((uint32_t)(v))
-#define sum64_endian_convert(v) le64_to_host((uint32_t)(v))
+#define sum64_endian_convert(v) le64_to_host((uint64_t)(v))
 
 enum summary_pidsi {
     SPID_CODEPAGE   = 0x00000001,
@@ -1419,30 +1398,51 @@ typedef struct propset_summary_entry {
     uint32_t offset;
 } propset_entry_t;
 
+/* metadata structures */
+#define OLE2_SUMMARY_ERROR_TOOSMALL      0x00000001
+#define OLE2_SUMMARY_ERROR_OOB           0x00000002
+#define OLE2_SUMMARY_ERROR_DATABUF       0x00000004
+#define OLE2_SUMMARY_ERROR_INVALID_ENTRY 0x00000008
+#define OLE2_SUMMARY_LIMIT_PROPS         0x00000010
+#define OLE2_SUMMARY_FLAG_TIMEOUT        0x00000020
+#define OLE2_SUMMARY_FLAG_CODEPAGE       0x00000040
+#define OLE2_SUMMARY_FLAG_UNKNOWN_PROPID 0x00000080
+#define OLE2_SUMMARY_FLAG_UNHANDLED_PROPTYPE 0x00000100
+#define OLE2_SUMMARY_FLAG_TRUNC_STR      0x00000200
+
 typedef struct summary_ctx {
     cli_ctx *ctx;
+    int mode;
+    fmap_t *sfmap;
     json_object *summary;
+    size_t maplen;
+    uint32_t flags;
 
-    uint16_t byte_order;
-    uint16_t version;
+    /* propset metadata */
+    uint32_t pssize; /* track from propset start, not tail start */
     int16_t codepage;
-    int toval;
+    int writecp;
 
+    /* property metadata */
     const char *propname;
-    int writecp; /* used to trigger writing the codepage value */
+
+    /* timeout meta */
+    int toval;
 } summary_ctx_t;
 
 static int
-ole2_process_property(summary_ctx_t *sctx, unsigned char *databuf, size_t buflen, uint32_t offset)
+ole2_process_property(summary_ctx_t *sctx, unsigned char *databuf, uint32_t offset)
 {
     uint16_t proptype, padding;
     int ret = CL_SUCCESS;
 
     if (cli_json_timeout_cycle_check(sctx->ctx, &(sctx->toval)) != CL_SUCCESS) {
+        sctx->flags |= OLE2_SUMMARY_FLAG_TIMEOUT;
         return CL_ETIMEOUT;
     }
 
-    if (offset+4 > buflen) {
+    if (offset+sizeof(proptype)+sizeof(padding) > sctx->pssize) {
+        sctx->flags |= OLE2_SUMMARY_ERROR_OOB;
         return CL_EFORMAT;
     }
 
@@ -1455,20 +1455,21 @@ ole2_process_property(summary_ctx_t *sctx, unsigned char *databuf, size_t buflen
 
     //cli_dbgmsg("proptype: 0x%04x\n", proptype);
     if (padding != 0) {
+        cli_dbgmsg("ole2_process_property: invalid padding value, non-zero\n");
+        sctx->flags |= OLE2_SUMMARY_ERROR_INVALID_ENTRY;
         return CL_EFORMAT;
     }
 
     switch (proptype) {
     case PT_EMPTY:
-        ret = cli_jsonnull(sctx->summary, sctx->propname);
-        break;
     case PT_NULL:
         ret = cli_jsonnull(sctx->summary, sctx->propname);
         break;
     case PT_INT16:
 	{
             int16_t dout;
-            if (offset+sizeof(dout) > buflen) {
+            if (offset+sizeof(dout) > sctx->pssize) {
+                sctx->flags |= OLE2_SUMMARY_ERROR_OOB;
                 return CL_EFORMAT;
             }
             memcpy(&dout, databuf+offset, sizeof(dout));
@@ -1476,7 +1477,8 @@ ole2_process_property(summary_ctx_t *sctx, unsigned char *databuf, size_t buflen
             /* endian conversion */
             dout = sum16_endian_convert(dout);
 
-            if (sctx->writecp) sctx->codepage = dout;
+            if (sctx->writecp)
+                sctx->codepage = dout;
 
             ret = cli_jsonint(sctx->summary, sctx->propname, dout);
             break;
@@ -1485,7 +1487,8 @@ ole2_process_property(summary_ctx_t *sctx, unsigned char *databuf, size_t buflen
     case PT_INT32v1:
 	{
             int32_t dout;
-            if (offset+sizeof(dout) > buflen) {
+            if (offset+sizeof(dout) > sctx->pssize) {
+                sctx->flags |= OLE2_SUMMARY_ERROR_OOB;
                 return CL_EFORMAT;
             }
             memcpy(&dout, databuf+offset, sizeof(dout));
@@ -1499,12 +1502,14 @@ ole2_process_property(summary_ctx_t *sctx, unsigned char *databuf, size_t buflen
     case PT_FLOAT32: /* review this please */
 	{
             float dout;
-            if (offset+sizeof(dout) > buflen) {
+            if (offset+sizeof(dout) > sctx->pssize) {
+                sctx->flags |= OLE2_SUMMARY_ERROR_OOB;
                 return CL_EFORMAT;
             }
             memcpy(&dout, databuf+offset, sizeof(dout));
             offset+=sizeof(dout);
-            /* TODO - endian conversion */
+            /* endian conversion */
+            dout = sum32_endian_convert(dout);
 
             ret = cli_jsondouble(sctx->summary, sctx->propname, dout);
             break;
@@ -1513,12 +1518,14 @@ ole2_process_property(summary_ctx_t *sctx, unsigned char *databuf, size_t buflen
     case PT_DOUBLE64: /* review this please */
 	{
             double dout;
-            if (offset+sizeof(dout) > buflen) {
+            if (offset+sizeof(dout) > sctx->pssize) {
+                sctx->flags |= OLE2_SUMMARY_ERROR_OOB;
                 return CL_EFORMAT;
             }
             memcpy(&dout, databuf+offset, sizeof(dout));
             offset+=sizeof(dout);
-            /* TODO - endian conversion */
+            /* endian conversion */
+            dout = sum64_endian_convert(dout);
 
             ret = cli_jsondouble(sctx->summary, sctx->propname, dout);
             break;
@@ -1526,7 +1533,8 @@ ole2_process_property(summary_ctx_t *sctx, unsigned char *databuf, size_t buflen
     case PT_BOOL:
 	{
             uint16_t dout;
-            if (offset+sizeof(dout) > buflen) {
+            if (offset+sizeof(dout) > sctx->pssize) {
+                sctx->flags |= OLE2_SUMMARY_ERROR_OOB;
                 return CL_EFORMAT;
             }
             memcpy(&dout, databuf+offset, sizeof(dout));
@@ -1539,7 +1547,8 @@ ole2_process_property(summary_ctx_t *sctx, unsigned char *databuf, size_t buflen
     case PT_INT8v1:
 	{
             int8_t dout;
-            if (offset+sizeof(dout) > buflen) {
+            if (offset+sizeof(dout) > sctx->pssize) {
+                sctx->flags |= OLE2_SUMMARY_ERROR_OOB;
                 return CL_EFORMAT;
             }
             memcpy(&dout, databuf+offset, sizeof(dout));
@@ -1552,7 +1561,8 @@ ole2_process_property(summary_ctx_t *sctx, unsigned char *databuf, size_t buflen
     case PT_UINT8:
 	{
             uint8_t dout;
-            if (offset+sizeof(dout) > buflen) {
+            if (offset+sizeof(dout) > sctx->pssize) {
+                sctx->flags |= OLE2_SUMMARY_ERROR_OOB;
                 return CL_EFORMAT;
             }
             memcpy(&dout, databuf+offset, sizeof(dout));
@@ -1565,7 +1575,8 @@ ole2_process_property(summary_ctx_t *sctx, unsigned char *databuf, size_t buflen
     case PT_UINT16:
 	{
             uint16_t dout;
-            if (offset+sizeof(dout) > buflen) {
+            if (offset+sizeof(dout) > sctx->pssize) {
+                sctx->flags |= OLE2_SUMMARY_ERROR_OOB;
                 return CL_EFORMAT;
             }
             memcpy(&dout, databuf+offset, sizeof(dout));
@@ -1573,7 +1584,8 @@ ole2_process_property(summary_ctx_t *sctx, unsigned char *databuf, size_t buflen
             /* endian conversion */
             dout = sum16_endian_convert(dout);
 
-            if (sctx->writecp) sctx->codepage = dout;
+            if (sctx->writecp)
+                sctx->codepage = dout;
 
             ret = cli_jsonint(sctx->summary, sctx->propname, dout);
             break;
@@ -1582,7 +1594,8 @@ ole2_process_property(summary_ctx_t *sctx, unsigned char *databuf, size_t buflen
     case PT_UINT32v1:
 	{
             uint32_t dout;
-            if (offset+sizeof(dout) > buflen) {
+            if (offset+sizeof(dout) > sctx->pssize) {
+                sctx->flags |= OLE2_SUMMARY_ERROR_OOB;
                 return CL_EFORMAT;
             }
             memcpy(&dout, databuf+offset, sizeof(dout));
@@ -1596,7 +1609,8 @@ ole2_process_property(summary_ctx_t *sctx, unsigned char *databuf, size_t buflen
     case PT_INT64:
 	{
             int64_t dout;
-            if (offset+sizeof(dout) > buflen) {
+            if (offset+sizeof(dout) > sctx->pssize) {
+                sctx->flags |= OLE2_SUMMARY_ERROR_OOB;
                 return CL_EFORMAT;
             }
             memcpy(&dout, databuf+offset, sizeof(dout));
@@ -1610,7 +1624,8 @@ ole2_process_property(summary_ctx_t *sctx, unsigned char *databuf, size_t buflen
     case PT_UINT64:
 	{
             uint64_t dout;
-            if (offset+sizeof(dout) > buflen) {
+            if (offset+sizeof(dout) > sctx->pssize) {
+                sctx->flags |= OLE2_SUMMARY_ERROR_OOB;
                 return CL_EFORMAT;
             }
             memcpy(&dout, databuf+offset, sizeof(dout));
@@ -1625,21 +1640,25 @@ ole2_process_property(summary_ctx_t *sctx, unsigned char *databuf, size_t buflen
     case PT_LPSTR:
         if (sctx->codepage == 0) {
             cli_dbgmsg("ole2_propset_json: current codepage is unknown, cannot parse char stream\n");
+            sctx->flags |= OLE2_SUMMARY_FLAG_CODEPAGE;
             break;
         }
         else if (sctx->codepage != WINUNICODE) {
             uint32_t strsize;
             char *outstr;
 
-            if (offset+sizeof(strsize) > buflen) {
+            if (offset+sizeof(strsize) > sctx->pssize) {
+                sctx->flags |= OLE2_SUMMARY_ERROR_OOB;
                 return CL_EFORMAT;
             }
 
             memcpy(&strsize, databuf+offset, sizeof(strsize));
             offset+=sizeof(strsize);
-            /* no need for endian conversion */
+            /* endian conversion */
+            strsize = sum32_endian_convert(strsize);
 
-            if (offset+strsize > buflen) {
+            if (offset+strsize > sctx->pssize) {
+                sctx->flags |= OLE2_SUMMARY_ERROR_OOB;
                 return CL_EFORMAT;
             }
 
@@ -1647,15 +1666,15 @@ ole2_process_property(summary_ctx_t *sctx, unsigned char *databuf, size_t buflen
             if (strsize > PROPSTRLIMIT) {
                 cli_dbgmsg("ole2_process_property: property string sized %lu truncated to size %lu\n",
                            (unsigned long)strsize, (unsigned long)PROPSTRLIMIT);
+                sctx->flags |= OLE2_SUMMARY_FLAG_TRUNC_STR;
                 strsize = PROPSTRLIMIT;
             }
 
-            outstr = cli_malloc(strsize+1);
+            outstr = cli_calloc(strsize+1, 1); /* last char must be NULL */
             if (!outstr) {
                 return CL_EMEM;
             }
             strncpy(outstr, databuf+offset, strsize);
-            outstr[strsize] = '\0'; /* guarentee a NULL-termination */
             ret = cli_jsonstr(sctx->summary, sctx->propname, outstr);
             free(outstr);
             break;
@@ -1666,14 +1685,19 @@ ole2_process_property(summary_ctx_t *sctx, unsigned char *databuf, size_t buflen
             uint32_t strsize;
             char *outstr, *outstr2;
 
-            if (offset+sizeof(strsize) > buflen) {
+            if (offset+sizeof(strsize) > sctx->pssize) {
+                sctx->flags |= OLE2_SUMMARY_ERROR_OOB;
                 return CL_EFORMAT;
             }
             memcpy(&strsize, databuf+offset, sizeof(strsize));
             offset+=sizeof(strsize);
-            /* no need for endian conversion */
+            /* endian conversion */
+            strsize = sum32_endian_convert(strsize);
+            
             if (proptype == PT_LPSTR) { /* fall-through specifics */
                 if (strsize % 2) {
+                    cli_dbgmsg("ole2_process_property: LPSTR using wchar not sized a multiple of 2\n");
+                    sctx->flags |= OLE2_SUMMARY_ERROR_INVALID_ENTRY;
                     return CL_EFORMAT;
                 }
             }
@@ -1681,19 +1705,26 @@ ole2_process_property(summary_ctx_t *sctx, unsigned char *databuf, size_t buflen
                 strsize*=2; /* Unicode strings are by length, not size */
             }
 
-            if (offset+strsize > buflen) {
+            /* limitation on string length */
+            if (strsize > (2*PROPSTRLIMIT)) {
+                cli_dbgmsg("ole2_process_property: property string sized %lu truncated to size %lu\n",
+                           (unsigned long)strsize, (unsigned long)(2*PROPSTRLIMIT));
+                sctx->flags |= OLE2_SUMMARY_FLAG_TRUNC_STR;
+                strsize = (2*PROPSTRLIMIT);
+            }
+
+            if (offset+strsize > sctx->pssize) {
+                sctx->flags |= OLE2_SUMMARY_ERROR_OOB;
                 return CL_EFORMAT;
             }
-            outstr = cli_malloc(strsize+2);
+            outstr = cli_calloc(strsize+2, 1); /* last two chars must be NULL */
             if (!outstr) {
                 return CL_EMEM;
             }
             strncpy(outstr, databuf+offset, strsize);
-            outstr[strsize] = '\0'; /* guarentee a UTF-16 NULL-termination */
-            outstr[strsize+1] = '\0';
             outstr2 = (char*)get_property_name2(outstr, strsize);
             if (outstr2) {
-                ret = cli_jsonstr(sctx->summary, sctx->propname, outstr);
+                ret = cli_jsonstr(sctx->summary, sctx->propname, outstr2);
                 free(outstr2);
             }
             free(outstr);
@@ -1704,7 +1735,8 @@ ole2_process_property(summary_ctx_t *sctx, unsigned char *databuf, size_t buflen
             uint32_t ltime, htime;
             uint64_t wtime = 0, utime =0;
 
-            if (offset+sizeof(ltime)+sizeof(htime) > buflen) {
+            if (offset+sizeof(ltime)+sizeof(htime) > sctx->pssize) {
+                sctx->flags |= OLE2_SUMMARY_ERROR_OOB;
                 return CL_EFORMAT;
             }
             memcpy(&ltime, databuf+offset, sizeof(ltime));
@@ -1728,179 +1760,210 @@ ole2_process_property(summary_ctx_t *sctx, unsigned char *databuf, size_t buflen
             else {
                 ret = cli_jsonint(sctx->summary, sctx->propname, (uint32_t)(utime & 0xFFFFFFFF));
             }
-
-            /* human-readble string JSON output */
-            //ret = cli_jsonstr(sctx->summary, sctx->propname, ctime((timer_t*)&utime));
             break;
 	}
     default:
         cli_dbgmsg("ole2_process_property: unhandled property type 0x%04x for %s property\n", 
                    proptype, sctx->propname);
+        sctx->flags |= OLE2_SUMMARY_FLAG_UNHANDLED_PROPTYPE;
     }
 
     return ret;
 }
 
-static int
-ole2_docsum_propset_json(summary_ctx_t *sctx, fmap_t *sumfmap, propset_entry_t *entry)
+static void ole2_translate_docsummary_propid(summary_ctx_t *sctx, uint32_t propid)
 {
-    uint32_t size, numprops, limitprops;
-    uint32_t propid, poffset;
-    unsigned char *databuf, *ptr = NULL;
-    unsigned i;
-    int ret = CL_SUCCESS;
-
-    sctx->codepage = 0;
-    sctx->writecp = 0;
-    sctx->propname = NULL;
-
-    /* examine property set metadata */
-    databuf = (unsigned char*)fmap_need_off_once(sumfmap, entry->offset, 8);
-    if (!databuf) {
-        return CL_EREAD;
+    switch(propid) {
+    case DSPID_CODEPAGE:
+        sctx->writecp = 1; /* must be set ONLY for codepage */
+        sctx->propname = "CodePage";
+        break;
+    case DSPID_CATEGORY:
+        sctx->propname = "Category";
+        break;
+    case DSPID_PRESFORMAT:
+        sctx->propname = "PresentationTarget";
+        break;
+    case DSPID_BYTECOUNT:
+        sctx->propname = "Bytes";
+        break;
+    case DSPID_LINECOUNT:
+        sctx->propname = "Lines";
+        break;
+    case DSPID_PARCOUNT:
+        sctx->propname = "Paragraphs";
+        break;
+    case DSPID_SLIDECOUNT:
+        sctx->propname = "Slides";
+        break;
+    case DSPID_NOTECOUNT:
+        sctx->propname = "Notes";
+        break;
+    case DSPID_HIDDENCOUNT:
+        sctx->propname = "HiddenSlides";
+        break;
+    case DSPID_MMCLIPCOUNT:
+        sctx->propname = "MMClips";
+        break;
+    case DSPID_SCALE:
+        sctx->propname = "Scale";
+        break;
+    case DSPID_HEADINGPAIR: /* VT_VARIANT | VT_VECTOR */
+        sctx->propname = "HeadingPairs";
+        break;
+    case DSPID_DOCPARTS:    /* VT_VECTOR | VT_LPSTR */
+        sctx->propname = "DocPartTitles";
+        break;
+    case DSPID_MANAGER:
+        sctx->propname = "Manager";
+        break;
+    case DSPID_COMPANY:
+        sctx->propname = "Company";
+        break;
+    case DSPID_LINKSDIRTY:
+        sctx->propname = "LinksDirty";
+        break;
+    case DSPID_CCHWITHSPACES:
+        sctx->propname = "Char&WSCount";
+        break;
+    case DSPID_SHAREDDOC:   /* SHOULD BE FALSE! */
+        sctx->propname = "SharedDoc";
+        break;
+    case DSPID_LINKBASE:    /* moved to user-defined */
+        sctx->propname = "LinkBase";
+        break;
+    case DSPID_HLINKS:      /* moved to user-defined */
+        sctx->propname = "HyperLinks";
+        break;
+    case DSPID_HYPERLINKSCHANGED:
+        sctx->propname = "HyperLinksChanged";
+        break;
+    case DSPID_VERSION:
+        sctx->propname = "Version";
+        break;
+    case DSPID_DIGSIG:
+        sctx->propname = "DigitalSig";
+        break;
+    case DSPID_CONTENTTYPE:
+        sctx->propname = "ContentType";
+        break;
+    case DSPID_CONTENTSTATUS:
+        sctx->propname = "ContentStatus";
+        break;
+    case DSPID_LANGUAGE:
+        sctx->propname = "Language";
+        break;
+    case DSPID_DOCVERSION:
+        sctx->propname = "DocVersion";
+        break;
+    default:
+        cli_dbgmsg("ole2_docsum_propset_json: unrecognized propid!\n");
+        sctx->flags |= OLE2_SUMMARY_FLAG_UNKNOWN_PROPID;
     }
-    memcpy(&size, databuf, sizeof(size));
-    memcpy(&numprops, databuf+sizeof(size), sizeof(numprops));
-
-    /* endian conversion */
-    size = sum32_endian_convert(size);
-    numprops = sum32_endian_convert(numprops);
-
-    cli_dbgmsg("ole2_docsum_propset_json: size: %u, numprops: %u\n", size, numprops);
-
-    /* extract the property packet and advance past metadata */
-    databuf = (unsigned char*)fmap_need_off_once(sumfmap, entry->offset, size);
-    if (!databuf) {
-        return CL_EREAD;
-    }
-    ptr = databuf+sizeof(size)+sizeof(numprops);
-
-    if (numprops > PROPCNTLIMIT) {
-        limitprops = PROPCNTLIMIT;
-    }
-    else {
-        limitprops = numprops;
-    }
-    cli_dbgmsg("ole2_docsum_propset_json: processing %u of %u (%u max) propeties\n",
-               limitprops, numprops, PROPCNTLIMIT);
-
-    for (i = 0; i < limitprops; ++i) {
-        memcpy(&propid, ptr, sizeof(propid));
-        ptr+=4;
-        memcpy(&poffset, ptr, sizeof(poffset));
-        ptr+=4;
-        /* endian conversion */
-        propid = sum32_endian_convert(propid);
-        poffset = sum32_endian_convert(poffset);
-
-        cli_dbgmsg("ole2_docsum_propset_json: propid: 0x%08x, poffset: %u\n", propid, poffset);
-
-        sctx->propname = NULL; sctx->writecp = 0;
-        switch(propid) {
-        case DSPID_CODEPAGE:
-            sctx->writecp = 1; /* must be set ONLY for codepage */
-            if (!sctx->propname) sctx->propname = "CodePage";
-        case DSPID_CATEGORY:
-            if (!sctx->propname) sctx->propname = "Category";
-        case DSPID_PRESFORMAT:
-            if (!sctx->propname) sctx->propname = "PresentationTarget";
-        case DSPID_BYTECOUNT:
-            if (!sctx->propname) sctx->propname = "Bytes";
-        case DSPID_LINECOUNT:
-            if (!sctx->propname) sctx->propname = "Lines";
-        case DSPID_PARCOUNT:
-            if (!sctx->propname) sctx->propname = "Paragraphs";
-        case DSPID_SLIDECOUNT:
-            if (!sctx->propname) sctx->propname = "Slides";
-        case DSPID_NOTECOUNT:
-            if (!sctx->propname) sctx->propname = "Notes";
-        case DSPID_HIDDENCOUNT:
-            if (!sctx->propname) sctx->propname = "HiddenSlides";
-        case DSPID_MMCLIPCOUNT:
-            if (!sctx->propname) sctx->propname = "MMClips";
-        case DSPID_SCALE:
-            if (!sctx->propname) sctx->propname = "Scale";
-        case DSPID_HEADINGPAIR: /* VT_VARIANT | VT_VECTOR */
-            if (!sctx->propname) sctx->propname = "HeadingPairs";
-        case DSPID_DOCPARTS:    /* VT_VECTOR | VT_LPSTR */
-            if (!sctx->propname) sctx->propname = "DocPartTitles";
-        case DSPID_MANAGER:
-            if (!sctx->propname) sctx->propname = "Manager";
-        case DSPID_COMPANY:
-            if (!sctx->propname) sctx->propname = "Company";
-        case DSPID_LINKSDIRTY:
-            if (!sctx->propname) sctx->propname = "LinksDirty";
-        case DSPID_CCHWITHSPACES:
-            if (!sctx->propname) sctx->propname = "Char&WSCount";
-        case DSPID_SHAREDDOC:   /* SHOULD BE FALSE! */
-            if (!sctx->propname) sctx->propname = "SharedDoc";
-        case DSPID_LINKBASE:    /* moved to user-defined */
-            if (!sctx->propname) sctx->propname = "LinkBase";
-        case DSPID_HLINKS:      /* moved to user-defined */
-            if (!sctx->propname) sctx->propname = "HyperLinks";
-        case DSPID_HYPERLINKSCHANGED:
-            if (!sctx->propname) sctx->propname = "HyperLinksChanged";
-        case DSPID_VERSION:
-            if (!sctx->propname) sctx->propname = "Version";
-        case DSPID_DIGSIG:
-            if (!sctx->propname) sctx->propname = "DigitalSig";
-        case DSPID_CONTENTTYPE:
-            if (!sctx->propname) sctx->propname = "ContentType";
-        case DSPID_CONTENTSTATUS:
-            if (!sctx->propname) sctx->propname = "ContentStatus";
-        case DSPID_LANGUAGE:
-            if (!sctx->propname) sctx->propname = "Language";
-        case DSPID_DOCVERSION:
-            if (!sctx->propname) sctx->propname = "DocVersion";
-
-            ret = ole2_process_property(sctx, databuf, size, poffset);
-            break;
-        default:
-            cli_dbgmsg("ole2_docsum_propset_json: unrecognized propid!\n");
-        }
-
-        if (ret != CL_SUCCESS)
-            break;
-    }
-
-    return ret;
 }
 
-static int
-ole2_summary_propset_json(summary_ctx_t *sctx, fmap_t *sumfmap, propset_entry_t *entry)
+static void ole2_translate_summary_propid(summary_ctx_t *sctx, uint32_t propid)
 {
-    uint32_t size, numprops, limitprops;
-    uint32_t propid, poffset;
-    unsigned char *databuf, *ptr = NULL;
-    unsigned i;
-    int ret;
+    switch(propid) {
+    case SPID_CODEPAGE:
+        sctx->writecp = 1; /* must be set ONLY for codepage */
+        sctx->propname = "CodePage";
+        break;
+    case SPID_TITLE:
+        sctx->propname = "Title";
+        break;
+    case SPID_SUBJECT:
+        sctx->propname = "Subject";
+        break;
+    case SPID_AUTHOR:
+        sctx->propname = "Author";
+        break;
+    case SPID_KEYWORDS:
+        sctx->propname = "Keywords";
+        break;
+    case SPID_COMMENTS:
+        sctx->propname = "Comments";
+        break;
+    case SPID_TEMPLATE:
+        sctx->propname = "Template";
+        break;
+    case SPID_LASTAUTHOR:
+        sctx->propname = "LastAuthor";
+        break;
+    case SPID_REVNUMBER:
+        sctx->propname = "RevNumber";
+        break;
+    case SPID_EDITTIME:
+        sctx->propname = "EditTime";
+        break;
+    case SPID_LASTPRINTED:
+        sctx->propname = "LastPrinted";
+        break;
+    case SPID_CREATEDTIME:
+        sctx->propname = "CreatedTime";
+        break;
+    case SPID_MODIFIEDTIME:
+        sctx->propname = "ModifiedTime";
+        break;
+    case SPID_PAGECOUNT:
+        sctx->propname = "PageCount";
+        break;
+    case SPID_WORDCOUNT:
+        sctx->propname = "WordCount";
+        break;
+    case SPID_CHARCOUNT:
+        sctx->propname = "CharCount";
+        break;
+    case SPID_THUMBNAIL:
+        sctx->propname = "Thumbnail";
+        break;
+    case SPID_APPNAME:
+        sctx->propname = "AppName";
+        break;
+    case SPID_SECURITY:
+        sctx->propname = "Security";
+        break;
+    default:
+        cli_dbgmsg("ole2_translate_summary_propid: unrecognized propid!\n");
+        sctx->flags |= OLE2_SUMMARY_FLAG_UNKNOWN_PROPID;
+    }
+}
 
+static int ole2_summary_propset_json(summary_ctx_t *sctx, off_t offset)
+{
+    unsigned char *hdr, *ps;
+    uint32_t numprops, limitprops;
+    off_t foff = offset, psoff = 0;
+    uint32_t propid, poffset;
+    int i, ret;
+
+    cli_dbgmsg("in ole2_summary_propset_json\n");
+
+    /* summary ctx propset-specific setup*/
     sctx->codepage = 0;
     sctx->writecp = 0;
     sctx->propname = NULL;
 
     /* examine property set metadata */
-    databuf = (unsigned char*)fmap_need_off_once(sumfmap, entry->offset, 8);
-    if (!databuf) {
+    if ((foff+(2*sizeof(uint32_t))) > sctx->maplen) {
+        sctx->flags |= OLE2_SUMMARY_ERROR_TOOSMALL;
+        return CL_EFORMAT;
+    }
+    hdr = (unsigned char*)fmap_need_off_once(sctx->sfmap, foff, (2*sizeof(uint32_t)));
+    if (!hdr) {
+        sctx->flags |= OLE2_SUMMARY_ERROR_DATABUF;
         return CL_EREAD;
     }
-    memcpy(&size, databuf, sizeof(size));
-    memcpy(&numprops, databuf+sizeof(size), sizeof(numprops));
-
+    //foff+=(2*sizeof(uint32_t)); // keep foff pointing to start of propset segment
+    psoff+=(2*sizeof(uint32_t));
+    memcpy(&(sctx->pssize), hdr, sizeof(sctx->pssize));
+    memcpy(&numprops, hdr+sizeof(sctx->pssize), sizeof(numprops));
     /* endian conversion */
-    size = sum32_endian_convert(size);
+    sctx->pssize = sum32_endian_convert(sctx->pssize);
     numprops = sum32_endian_convert(numprops);
-
-    cli_dbgmsg("ole2_summary_propset_json: size: %u, numprops: %u\n", size, numprops);
-
-    /* extract the property packet and advance past metadata */
-    databuf = (unsigned char*)fmap_need_off_once(sumfmap, entry->offset, size);
-    if (!databuf) {
-        return CL_EREAD;
-    }
-    ptr = databuf+sizeof(size)+sizeof(numprops);
-
+    cli_dbgmsg("ole2_summary_propset_json: pssize: %u, numprops: %u\n", sctx->pssize, numprops);
     if (numprops > PROPCNTLIMIT) {
+        sctx->flags |= OLE2_SUMMARY_LIMIT_PROPS;
         limitprops = PROPCNTLIMIT;
     }
     else {
@@ -1909,219 +1972,222 @@ ole2_summary_propset_json(summary_ctx_t *sctx, fmap_t *sumfmap, propset_entry_t 
     cli_dbgmsg("ole2_summary_propset_json: processing %u of %u (%u max) propeties\n",
                limitprops, numprops, PROPCNTLIMIT);
 
+    /* extract remaining fragment of propset */
+    if (foff+(sctx->pssize) > sctx->maplen) {
+        sctx->flags |= OLE2_SUMMARY_ERROR_TOOSMALL;
+        return CL_EFORMAT;
+    }
+    ps = (unsigned char*)fmap_need_off_once(sctx->sfmap, foff, sctx->pssize);
+    if (!ps) {
+        sctx->flags |= OLE2_SUMMARY_ERROR_DATABUF;
+        return CL_EREAD;
+    }
+
+    /* iterate over the properties */
     for (i = 0; i < limitprops; ++i) {
-        memcpy(&propid, ptr, sizeof(propid));
-        ptr+=4;
-        memcpy(&poffset, ptr, sizeof(poffset));
-        ptr+=4;
+        uint32_t propid, propoff;
+
+        if (psoff+sizeof(propid)+sizeof(poffset) > sctx->pssize) {
+            sctx->flags |= OLE2_SUMMARY_ERROR_OOB;
+            return CL_EFORMAT;
+        }
+        memcpy(&propid, ps+psoff, sizeof(propid));
+        psoff+=sizeof(propid);
+        memcpy(&propoff, ps+psoff, sizeof(propoff));
+        psoff+=sizeof(propoff);
         /* endian conversion */
         propid = sum32_endian_convert(propid);
-        poffset = sum32_endian_convert(poffset);
-
-        cli_dbgmsg("ole2_summary_propset_json: propid: 0x%08x, poffset: %u\n", propid, poffset);
+        propoff = sum32_endian_convert(propoff);
+        cli_dbgmsg("ole2_summary_propset_json: propid: 0x%08x, propoff: %u\n", propid, propoff);
 
         sctx->propname = NULL; sctx->writecp = 0;
-        switch(propid) {
-        case SPID_CODEPAGE:
-            sctx->writecp = 1; /* must be set ONLY for codepage */
-            if (!sctx->propname) sctx->propname = "CodePage";
-        case SPID_TITLE:
-            if (!sctx->propname) sctx->propname = "Title";
-        case SPID_SUBJECT:
-            if (!sctx->propname) sctx->propname = "Subject";
-        case SPID_AUTHOR:
-            if (!sctx->propname) sctx->propname = "Author";
-        case SPID_KEYWORDS:
-            if (!sctx->propname) sctx->propname = "Keywords";
-        case SPID_COMMENTS:
-            if (!sctx->propname) sctx->propname = "Comments";
-        case SPID_TEMPLATE:
-            if (!sctx->propname) sctx->propname = "Template";
-        case SPID_LASTAUTHOR:
-            if (!sctx->propname) sctx->propname = "LastAuthor";
-        case SPID_REVNUMBER:
-            if (!sctx->propname) sctx->propname = "RevNumber";
-        case SPID_EDITTIME:
-            if (!sctx->propname) sctx->propname = "EditTime";
-        case SPID_LASTPRINTED:
-            if (!sctx->propname) sctx->propname = "LastPrinted";
-        case SPID_CREATEDTIME:
-            if (!sctx->propname) sctx->propname = "CreatedTime";
-        case SPID_MODIFIEDTIME:
-            if (!sctx->propname) sctx->propname = "ModifiedTime";
-        case SPID_PAGECOUNT:
-            if (!sctx->propname) sctx->propname = "PageCount";
-        case SPID_WORDCOUNT:
-            if (!sctx->propname) sctx->propname = "WordCount";
-        case SPID_CHARCOUNT:
-            if (!sctx->propname) sctx->propname = "CharCount";
-        case SPID_THUMBNAIL:
-            if (!sctx->propname) sctx->propname = "Thumbnail";
-        case SPID_APPNAME:
-            if (!sctx->propname) sctx->propname = "AppName";
-        case SPID_SECURITY:
-            if (!sctx->propname) sctx->propname = "Security";
+        if (!sctx->mode)
+            ole2_translate_summary_propid(sctx, propid);
+        else
+            ole2_translate_docsummary_propid(sctx, propid);
 
-            ret = ole2_process_property(sctx, databuf, size, poffset);
-            break;
-        default:
-            cli_dbgmsg("ole2_summary_propset_json: unrecognized propid!\n");
+        if (sctx->propname != NULL) {
+            ret = ole2_process_property(sctx, ps, propoff);
+            if (ret != CL_SUCCESS)
+                return ret;
+        }
+        else {
+            /* add unknown propid flag */
         }
     }
 
     return CL_SUCCESS;
 }
+
+static int cli_ole2_summary_json_cleanup(summary_ctx_t *sctx, int retcode)
+{
+    json_object *jobj, *jarr;
+
+    cli_dbgmsg("in cli_ole2_summary_json_cleanup: %d[%x]\n", retcode, sctx->flags);
+
+    if (sctx->sfmap) {
+        funmap(sctx->sfmap);
+    }
+
+    if (sctx->flags) {
+        jarr = cli_jsonarray(sctx->summary, "ParseErrors");
+
+        /* check errors */
+        if (sctx->flags & OLE2_SUMMARY_ERROR_TOOSMALL) {
+            cli_jsonstr(jarr, NULL, "OLE2_SUMMARY_ERROR_TOOSMALL");
+        }
+        if (sctx->flags & OLE2_SUMMARY_ERROR_OOB) {
+            cli_jsonstr(jarr, NULL, "OLE2_SUMMARY_ERROR_OOB");
+        }
+        if (sctx->flags & OLE2_SUMMARY_ERROR_DATABUF) {
+            cli_jsonstr(jarr, NULL, "OLE2_SUMMARY_ERROR_DATABUF");
+        }
+        if (sctx->flags & OLE2_SUMMARY_ERROR_INVALID_ENTRY) {
+            cli_jsonstr(jarr, NULL, "OLE2_SUMMARY_ERROR_INVALID_ENTRY");
+        }
+        if (sctx->flags & OLE2_SUMMARY_LIMIT_PROPS) {
+            cli_jsonstr(jarr, NULL, "OLE2_SUMMARY_LIMIT_PROPS");
+        }
+        if (sctx->flags & OLE2_SUMMARY_FLAG_TIMEOUT) {
+            cli_jsonstr(jarr, NULL, "OLE2_SUMMARY_FLAG_TIMEOUT");
+        }
+        if (sctx->flags & OLE2_SUMMARY_FLAG_CODEPAGE) {
+            cli_jsonstr(jarr, NULL, "OLE2_SUMMARY_FLAG_CODEPAGE");
+        }
+        if (sctx->flags & OLE2_SUMMARY_FLAG_UNKNOWN_PROPID) {
+            cli_jsonstr(jarr, NULL, "OLE2_SUMMARY_FLAG_UNKNOWN_PROPID");
+        }
+        if (sctx->flags & OLE2_SUMMARY_FLAG_UNHANDLED_PROPTYPE) {
+            cli_jsonstr(jarr, NULL, "OLE2_SUMMARY_FLAG_UNHANDLED_PROPTYPE");
+        }
+        if (sctx->flags & OLE2_SUMMARY_FLAG_TRUNC_STR) {
+            cli_jsonstr(jarr, NULL, "OLE2_SUMMARY_FLAG_TRUNC_STR");
+        }
+    }
+
+    return retcode;
+}
+
+
 #endif /* HAVE_JSON */
 
-int
-cli_ole2_summary_json(cli_ctx *ctx, int fd, int mode)
+int cli_ole2_summary_json(cli_ctx *ctx, int fd, int mode)
 {
 #if HAVE_JSON
     summary_ctx_t sctx;
-    fmap_t *sumfmap;
-    summary_stub_t sumstub;
-    propset_entry_t pentry[2];
     STATBUF statbuf;
+    off_t foff = 0;
     unsigned char *databuf;
-    size_t maplen;
+    summary_stub_t sumstub;
+    propset_entry_t pentry;
     int ret = CL_SUCCESS;
-    struct json_object *check = NULL;
 
+    cli_dbgmsg("in cli_ole2_summary_json\n");
+
+    /* preliminary sanity checks */
     if (ctx == NULL) {
         return CL_ENULLARG;
     }
-    memset(&sctx, 0, sizeof(sctx));
-    sctx.ctx = ctx;
 
     if (fd < 0) {
         cli_dbgmsg("ole2_summary_json: invalid file descriptor\n");
         return CL_ENULLARG; /* placeholder */
     }
 
+    if (mode != 0 && mode != 1) {
+        cli_dbgmsg("ole2_summary_json: invalid mode specified\n");
+        return CL_ENULLARG; /* placeholder */
+    }
+
+    /* summary ctx setup */
+    memset(&sctx, 0, sizeof(sctx));
+    sctx.ctx = ctx;
+    sctx.mode = mode;
+
     if (FSTAT(fd, &statbuf) == -1) {
         cli_dbgmsg("ole2_summary_json: cannot stat file descriptor\n");
         return CL_ESTAT;
     }
 
-    sumfmap = fmap(fd, 0, statbuf.st_size);
-    if (!sumfmap) {
+    sctx.sfmap = fmap(fd, 0, statbuf.st_size);
+    if (!sctx.sfmap) {
         cli_dbgmsg("ole2_summary_json: failed to get fmap\n");
         return CL_EMAP;
     }
+    sctx.maplen = sctx.sfmap->len;
+    cli_dbgmsg("ole2_summary_json: streamsize: %u\n", sctx.maplen);
 
-    maplen = sumfmap->len;
-    cli_dbgmsg("ole2_summary_json: streamsize: %u\n", maplen);
-    if (maplen < sizeof(summary_stub_t)) {
-        cli_dbgmsg("ole2_summary_json: stream is too small to contain summary stub!");
-        funmap(sumfmap);
-        return CL_EFORMAT;
-    }
-    databuf = (unsigned char*)fmap_need_off_once(sumfmap, 0, sizeof(summary_stub_t));
-    if (!databuf) {
-        funmap(sumfmap);
-        return CL_EREAD;
-    }
-
-    /* Process the Summary Stream */
-    memcpy(&sumstub, databuf, sizeof(summary_stub_t));
-
-    /* endian conversion */
-    sumstub.byte_order = le16_to_host(sumstub.byte_order);
-    if (sumstub.byte_order != 0xfffe) {
-        cli_dbgmsg("ole2_summary_json: byteorder 0x%x is invalid\n", sumstub.byte_order);
-        funmap(sumfmap);
-        return CL_EFORMAT;
-    }
-    sumstub.version = sum16_endian_convert(sumstub.version);
-    sumstub.system = sum32_endian_convert(sumstub.system);
-    sumstub.num_propsets = sum32_endian_convert(sumstub.num_propsets);
-
-    cli_dbgmsg("ole2_summary_json: byteorder 0x%x\n", sumstub.byte_order);
-
-    /* summary context setup */
-    sctx.byte_order = sumstub.byte_order;
-    sctx.version = sumstub.version;
-    sctx.summary = json_object_new_object();
+    if (!mode)
+        sctx.summary = cli_jsonobj(ctx->wrkproperty, "SummaryInfo");
+    else
+        sctx.summary = cli_jsonobj(ctx->wrkproperty, "DocSummaryInfo");
     if (!sctx.summary) {
         cli_errmsg("ole2_summary_json: no memory for json object.\n");
-        funmap(sumfmap);
-        return CL_EMEM;
+        return cli_ole2_summary_json_cleanup(&sctx, CL_EMEM);
     }
 
     sctx.codepage = 0;
     sctx.writecp = 0;
 
-    cli_dbgmsg("ole2_summary_json: %u property set(s) detected\n", sumstub.num_propsets);
-    if (sumstub.num_propsets == 1) {
-        databuf = (unsigned char*)fmap_need_off_once(sumfmap, sizeof(summary_stub_t),
-                                                     sizeof(propset_entry_t));
-        if (!databuf) {
-            json_object_put(sctx.summary);
-            funmap(sumfmap);
-            return CL_EREAD;
-        }
-        memcpy(pentry, databuf, sizeof(propset_entry_t));
-        /* endian conversion */
-        pentry[0].offset = sum32_endian_convert(pentry[0].offset);
-
-        if (!mode) {
-            json_object_object_add(ctx->wrkproperty, "SummaryInfo", sctx.summary);
-            if ((ret = ole2_summary_propset_json(&sctx, sumfmap, &pentry[0])) != CL_SUCCESS) {
-                funmap(sumfmap);
-                return ret;
-            }
-        }
-        else {
-            json_object_object_add(ctx->wrkproperty, "DocSummaryInfo", sctx.summary);
-            if ((ret = ole2_docsum_propset_json(&sctx, sumfmap, &pentry[0])) != CL_SUCCESS) {
-                funmap(sumfmap);
-                return ret;
-            }
-        }
+    /* acquire property stream metadata */
+    if (sctx.maplen < sizeof(summary_stub_t)) {
+        sctx.flags |= OLE2_SUMMARY_ERROR_TOOSMALL;
+        return cli_ole2_summary_json_cleanup(&sctx, CL_EFORMAT);
     }
-    else if (sumstub.num_propsets == 2) {
-        databuf = (unsigned char*)fmap_need_off_once(sumfmap, sizeof(summary_stub_t),
-                                                     2*sizeof(propset_entry_t));
-        if (!databuf) {
-            json_object_put(sctx.summary);
-            funmap(sumfmap);
-            return CL_EREAD;
-        }
-        memcpy(pentry, databuf, 2*sizeof(propset_entry_t));
-        /* endian conversion */
-        pentry[0].offset = sum32_endian_convert(pentry[0].offset);
-        pentry[1].offset = sum32_endian_convert(pentry[1].offset);
-
-        /* multi-propset handling */
-        cli_jsonbool(ctx->wrkproperty, "HasUserDefined", 1);
-
-        /* first propset is user-defined, ignored for now */
-        if (!mode) {
-            json_object_object_add(ctx->wrkproperty, "SummaryInfo", sctx.summary);
-            if ((ret = ole2_summary_propset_json(&sctx, sumfmap, &pentry[0])) != CL_SUCCESS) {
-                funmap(sumfmap);
-                return ret;
-            }
-        }
-        else {
-            json_object_object_add(ctx->wrkproperty, "DocSummaryInfo", sctx.summary);
-            if ((ret = ole2_docsum_propset_json(&sctx, sumfmap, &pentry[0])) != CL_SUCCESS) {
-                funmap(sumfmap);
-                return ret;
-            }
-        }
+    databuf = (unsigned char*)fmap_need_off_once(sctx.sfmap, foff, sizeof(summary_stub_t));
+    if (!databuf) {
+        sctx.flags |= OLE2_SUMMARY_ERROR_DATABUF;
+        return cli_ole2_summary_json_cleanup(&sctx, CL_EREAD);
     }
-    else {
+    foff += sizeof(summary_stub_t);
+    memcpy(&sumstub, databuf, sizeof(summary_stub_t));
+
+    /* endian conversion and checks */
+    sumstub.byte_order = le16_to_host(sumstub.byte_order);
+    if (sumstub.byte_order != 0xfffe) {
+        cli_dbgmsg("ole2_summary_json: byteorder 0x%x is invalid\n", sumstub.byte_order);
+        sctx.flags |= OLE2_SUMMARY_ERROR_INVALID_ENTRY;
+        return cli_ole2_summary_json_cleanup(&sctx, CL_EFORMAT);;
+    }
+    sumstub.version = sum16_endian_convert(sumstub.version); /*unused*/
+    sumstub.system = sum32_endian_convert(sumstub.system); /*unused*/
+    sumstub.num_propsets = sum32_endian_convert(sumstub.num_propsets);
+    if (sumstub.num_propsets != 1 && sumstub.num_propsets != 2) {
         cli_dbgmsg("ole2_summary_json: invalid number of property sets\n");
-        funmap(sumfmap);
-        return CL_EFORMAT;
+        sctx.flags |= OLE2_SUMMARY_ERROR_INVALID_ENTRY;
+        return cli_ole2_summary_json_cleanup(&sctx, CL_EFORMAT);
     }
 
-    funmap(sumfmap);
-    return ret;
+    cli_dbgmsg("ole2_summary_json: byteorder 0x%x\n", sumstub.byte_order);
+    cli_dbgmsg("ole2_summary_json: %u property set(s) detected\n", sumstub.num_propsets);
+
+    /* first property set (index=0) is always SummaryInfo or DocSummaryInfo */
+    if ((sctx.maplen-foff) < sizeof(propset_entry_t)) {
+        sctx.flags |= OLE2_SUMMARY_ERROR_TOOSMALL;
+        return cli_ole2_summary_json_cleanup(&sctx, CL_EFORMAT);
+    }
+    databuf = (unsigned char*)fmap_need_off_once(sctx.sfmap, foff, sizeof(propset_entry_t));
+    if (!databuf) {
+        sctx.flags |= OLE2_SUMMARY_ERROR_DATABUF;
+        return cli_ole2_summary_json_cleanup(&sctx, CL_EREAD);
+    }
+    foff += sizeof(propset_entry_t);
+    memcpy(&pentry, databuf, sizeof(propset_entry_t));
+    /* endian conversion */
+    pentry.offset = sum32_endian_convert(pentry.offset);
+
+    if ((ret = ole2_summary_propset_json(&sctx, pentry.offset)) != CL_SUCCESS) {
+        return cli_ole2_summary_json_cleanup(&sctx, ret);
+    }
+
+    /* second property set (index=1) is always a custom property set (if present) */
+    if (sumstub.num_propsets == 2) {
+        cli_jsonbool(ctx->wrkproperty, "HasUserDefinedProperties", 1);
+    }
+
+    return cli_ole2_summary_json_cleanup(&sctx, CL_SUCCESS);
 #else
     cli_dbgmsg("ole2_summary_json: libjson needs to enabled!");
     return CL_SUCCESS;
-#endif
+#endif /* HAVE_JSON */
 }
-
