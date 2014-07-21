@@ -72,6 +72,7 @@ char hostid[37];
 
 void submit_host_info(struct optstruct *opts);
 char *get_hostid(void *cbdata);
+int is_valid_hostid(void);
 
 static void
 sighandler (int sig)
@@ -262,6 +263,9 @@ static void
 msg_callback (enum cl_msg severity, const char *fullmsg, const char *msg,
               void *ctx)
 {
+    UNUSEDPARAM(fullmsg);
+    UNUSEDPARAM(ctx);
+
     switch (severity)
     {
     case CL_MSG_ERROR:
@@ -297,8 +301,6 @@ main (int argc, char **argv)
 
     if (check_flevel ())
         exit (FCE_INIT);
-
-    cl_initialize_crypto();
 
     if ((retcl = cl_init (CL_INIT_DEFAULT)))
     {
@@ -744,7 +746,6 @@ main (int argc, char **argv)
 
 void submit_host_info(struct optstruct *opts)
 {
-    struct optstruct *opt;
     struct cl_engine *engine;
     cli_intel_t *intel;
 
@@ -814,6 +815,8 @@ int is_valid_hostid(void)
 
 char *get_hostid(void *cbdata)
 {
+    UNUSEDPARAM(cbdata);
+
     if (!strcmp(hostid, "none"))
         return NULL;
 

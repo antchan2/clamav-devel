@@ -303,16 +303,13 @@ static char *getdsig(const char *host, const char *user, const unsigned char *da
 	    return NULL;
 	}
 #endif
-	if(scanf("%as", &pt) == EOF || !pt) {
+	if(scanf("%30s", pass) == EOF || !pt) {
 	    mprintf("!getdsig: Can't get password\n");
 #ifdef HAVE_TERMIOS_H
 	    tcsetattr(0, TCSAFLUSH, &old);
 #endif
 	    return NULL;
 	}
-	strncpy(pass, pt, sizeof(pass));
-	pass[sizeof(pass)-1]='\0';
-	free(pt);
 
 #ifdef HAVE_TERMIOS_H
 	if(tcsetattr(0, TCSAFLUSH, &old)) {
@@ -848,13 +845,10 @@ static int build(const struct optstruct *opts)
 	builder[sizeof(builder)-1]='\0';
     } else {
 	mprintf("Builder name: ");
-	if(scanf("%as", &pt) == EOF || !pt) {
+	if(scanf("%32s", builder) == EOF || !pt) {
 	    mprintf("!build: Can't get builder name\n");
 	    return -1;
 	}
-	strncpy(builder, pt, sizeof(builder));
-	builder[sizeof(builder)-1]='\0';
-	free(pt);
     }
 
     /* add builder */
@@ -2990,8 +2984,6 @@ int main(int argc, char **argv)
 
     if(check_flevel())
 	exit(1);
-
-    cl_initialize_crypto();
 
     if((ret = cl_init(CL_INIT_DEFAULT)) != CL_SUCCESS) {
 	mprintf("!Can't initialize libclamav: %s\n", cl_strerror(ret));

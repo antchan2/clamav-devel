@@ -23,7 +23,6 @@
  * TODO: Embedded fonts
  * TODO: Predictor image handling
  */
-static	char	const	rcsid[] = "$Id: pdf.c,v 1.61 2007/02/12 20:46:09 njh Exp $";
 
 #if HAVE_CONFIG_H
 #include "clamav-config.h"
@@ -77,6 +76,7 @@ static	const	char	*pdf_nextobject(const char *ptr, size_t len);
 /* PDF statistics callbacks and related */
 struct pdfname_action;
 
+#if HAVE_JSON
 static void pdf_export_json(struct pdf_struct *);
 
 static void ASCIIHexDecode_cb(struct pdf_struct *, struct pdf_obj *, struct pdfname_action *);
@@ -110,6 +110,7 @@ static void Colors_cb(struct pdf_struct *pdf, struct pdf_obj *obj, struct pdfnam
 static void RichMedia_cb(struct pdf_struct *pdf, struct pdf_obj *obj, struct pdfname_action *act);
 static void AcroForm_cb(struct pdf_struct *pdf, struct pdf_obj *obj, struct pdfname_action *act);
 static void XFA_cb(struct pdf_struct *pdf, struct pdf_obj *obj, struct pdfname_action *act);
+#endif
 /* End PDF statistics callbacks and related */
 
 static int xrefCheck(const char *xref, const char *eof)
@@ -286,6 +287,8 @@ int pdf_findobj(struct pdf_struct *pdf)
 
 static int filter_writen(struct pdf_struct *pdf, struct pdf_obj *obj, int fout, const char *buf, off_t len, off_t *sum)
 {
+    UNUSEDPARAM(obj);
+
     if (cli_checklimits("pdf", pdf->ctx, *sum, 0, 0))
         return len; /* pretend it was a successful write to suppress CL_EWRITE */
 
@@ -636,6 +639,8 @@ static int run_pdf_hooks(struct pdf_struct *pdf, enum pdf_phase phase, int fd, i
     cli_ctx *ctx = pdf->ctx;
     fmap_t *map;
 
+    UNUSEDPARAM(dumpid);
+
     bc_ctx = cli_bytecode_context_alloc();
     if (!bc_ctx) {
         cli_errmsg("cli_pdf: can't allocate memory for bc_ctx");
@@ -664,6 +669,7 @@ static int run_pdf_hooks(struct pdf_struct *pdf, enum pdf_phase phase, int fd, i
 }
 
 static void dbg_printhex(const char *msg, const char *hex, unsigned len);
+
 static void aes_decrypt(const unsigned char *in, off_t *length, unsigned char *q, char *key, unsigned key_n, int has_iv)
 {
     unsigned long rk[RKLENGTH(256)];
@@ -693,7 +699,7 @@ static void aes_decrypt(const unsigned char *in, off_t *length, unsigned char *q
     }
 
     cli_dbgmsg("aes_decrypt: Calling rijndaelSetupDecrypt\n");
-    nrounds = rijndaelSetupDecrypt(rk, key, key_n*8);
+    nrounds = rijndaelSetupDecrypt(rk, (const unsigned char *)key, key_n*8);
     cli_dbgmsg("aes_decrypt: Beginning rijndaelDecrypt\n");
 
     while (len >= 16) {
@@ -796,7 +802,7 @@ static char *decrypt_any(struct pdf_struct *pdf, uint32_t id, const char *in, of
         break;
     case ENC_AESV2:
         cli_dbgmsg("cli_pdf: enc is aesv2\n");
-        aes_decrypt(in, length, q, result, n, 1);
+        aes_decrypt((const unsigned char *)in, length, q, (char *)result, n, 1);
 
         noisy_msg(pdf, "decrypted AES(v2) data\n");
 
@@ -808,7 +814,7 @@ static char *decrypt_any(struct pdf_struct *pdf, uint32_t id, const char *in, of
             return NULL;
         }
 
-        aes_decrypt(in, length, q, pdf->key, pdf->keylen, 1);
+        aes_decrypt((const unsigned char *)in, length, q, pdf->key, pdf->keylen, 1);
 
         noisy_msg(pdf, "decrypted AES(v3) data\n");
 
@@ -837,7 +843,7 @@ static char *decrypt_any(struct pdf_struct *pdf, uint32_t id, const char *in, of
         return NULL;
     }
 
-    return q;
+    return (char *)q;
 }
 
 static enum enc_method get_enc_method(struct pdf_struct *pdf, struct pdf_obj *obj)
@@ -883,7 +889,7 @@ static void process(struct text_norm_state *s, enum cstate *st, const char *buf,
             if (*buf == ')') {
                 *st = CSTATE_TJ;
             } else {
-                if (text_normalize_buffer(s, buf, 1) != 1) {
+                if (text_normalize_buffer(s, (const unsigned char *)buf, 1) != 1) {
                     cli_writen(fout, s->out, s->out_pos);
                     text_normalize_reset(s);
                 }
@@ -915,7 +921,7 @@ static int pdf_scan_contents(int fd, struct pdf_struct *pdf)
         return CL_ETMPFILE;
     }
 
-    text_normalize_init(&s, outbuff, sizeof(outbuff));
+    text_normalize_init(&s, (unsigned char *)outbuff, sizeof(outbuff));
     while (1) {
         n = cli_readn(fd, inbuf, sizeof(inbuf));
         if (n <= 0)
@@ -1040,14 +1046,14 @@ int pdf_extract_obj(struct pdf_struct *pdf, struct pdf_obj *obj, uint32_t flags)
 
                     cli_dbgmsg("cli_pdf: calculated length %ld\n", length);
                 } else {
-                    if (size > length+2) {
+                    if (size > (size_t)length+2) {
                         cli_dbgmsg("cli_pdf: calculated length %ld < %ld\n",
                                length, size);
                         length = size;
                     }
                 }
 
-                if (orig_length && size > orig_length + 20) {
+                if (orig_length && size > (size_t)orig_length + 20) {
                     cli_dbgmsg("cli_pdf: orig length: %ld, length: %ld, size: %ld\n", orig_length, length, size);
                     pdfobj_flag(pdf, obj, BAD_STREAMLEN);
                 }
@@ -1293,9 +1299,12 @@ struct pdfname_action {
     enum pdf_objflags set_objflag;/* OBJ_DICT is noop */
     enum objstate from_state;/* STATE_NONE is noop */
     enum objstate to_state;
+#if HAVE_JSON
     void (*pdf_stats_cb)(struct pdf_struct *pdf, struct pdf_obj *obj, struct pdfname_action *act);
+#endif
 };
 
+#if HAVE_JSON
 static struct pdfname_action pdfname_actions[] = {
     {"ASCIIHexDecode", OBJ_FILTER_AH, STATE_FILTER, STATE_FILTER, ASCIIHexDecode_cb},
     {"ASCII85Decode", OBJ_FILTER_A85, STATE_FILTER, STATE_FILTER, ASCII85Decode_cb},
@@ -1344,6 +1353,43 @@ static struct pdfname_action pdfname_actions[] = {
     {"AcroForm", OBJ_DICT, STATE_NONE, STATE_NONE, AcroForm_cb},
     {"XFA", OBJ_DICT, STATE_NONE, STATE_NONE, XFA_cb}
 };
+#else
+static struct pdfname_action pdfname_actions[] = {
+    {"ASCIIHexDecode", OBJ_FILTER_AH, STATE_FILTER, STATE_FILTER},
+    {"ASCII85Decode", OBJ_FILTER_A85, STATE_FILTER, STATE_FILTER},
+    {"A85", OBJ_FILTER_A85, STATE_FILTER, STATE_FILTER},
+    {"AHx", OBJ_FILTER_AH, STATE_FILTER, STATE_FILTER},
+    {"EmbeddedFile", OBJ_EMBEDDED_FILE, STATE_NONE, STATE_NONE},
+    {"FlateDecode", OBJ_FILTER_FLATE, STATE_FILTER, STATE_FILTER},
+    {"Fl", OBJ_FILTER_FLATE, STATE_FILTER, STATE_FILTER},
+    {"Image", OBJ_IMAGE, STATE_NONE, STATE_NONE},
+    {"LZWDecode", OBJ_FILTER_LZW, STATE_FILTER, STATE_FILTER},
+    {"LZW", OBJ_FILTER_LZW, STATE_FILTER, STATE_FILTER},
+    {"RunLengthDecode", OBJ_FILTER_RL, STATE_FILTER, STATE_FILTER},
+    {"RL", OBJ_FILTER_RL, STATE_FILTER, STATE_FILTER},
+    {"CCITTFaxDecode", OBJ_FILTER_FAX, STATE_FILTER, STATE_FILTER},
+    {"CCF", OBJ_FILTER_FAX, STATE_FILTER, STATE_FILTER},
+    {"JBIG2Decode", OBJ_FILTER_DCT, STATE_FILTER, STATE_FILTER},
+    {"DCTDecode", OBJ_FILTER_DCT, STATE_FILTER, STATE_FILTER},
+    {"DCT", OBJ_FILTER_DCT, STATE_FILTER, STATE_FILTER},
+    {"JPXDecode", OBJ_FILTER_JPX, STATE_FILTER, STATE_FILTER},
+    {"Crypt",  OBJ_FILTER_CRYPT, STATE_FILTER, STATE_NONE},
+    {"Standard", OBJ_FILTER_STANDARD, STATE_FILTER, STATE_FILTER},
+    {"Sig",    OBJ_SIGNED, STATE_ANY, STATE_NONE},
+    {"V",     OBJ_SIGNED, STATE_ANY, STATE_NONE},
+    {"R",     OBJ_SIGNED, STATE_ANY, STATE_NONE},
+    {"Linearized", OBJ_DICT, STATE_NONE, STATE_LINEARIZED},
+    {"Filter", OBJ_HASFILTERS, STATE_ANY, STATE_FILTER},
+    {"JavaScript", OBJ_JAVASCRIPT, STATE_S, STATE_JAVASCRIPT},
+    {"Length", OBJ_DICT, STATE_FILTER, STATE_NONE},
+    {"S", OBJ_DICT, STATE_NONE, STATE_S},
+    {"Type", OBJ_DICT, STATE_NONE, STATE_NONE},
+    {"OpenAction", OBJ_OPENACTION, STATE_ANY, STATE_OPENACTION},
+    {"Launch", OBJ_LAUNCHACTION, STATE_ANY, STATE_LAUNCHACTION},
+    {"Page", OBJ_PAGE, STATE_NONE, STATE_NONE},
+    {"Contents", OBJ_CONTENTS, STATE_NONE, STATE_CONTENTS}
+};
+#endif
 
 #define KNOWN_FILTERS ((1 << OBJ_FILTER_AH) | (1 << OBJ_FILTER_RL) | (1 << OBJ_FILTER_A85) | (1 << OBJ_FILTER_FLATE) | (1 << OBJ_FILTER_LZW) | (1 << OBJ_FILTER_FAX) | (1 << OBJ_FILTER_DCT) | (1 << OBJ_FILTER_JPX) | (1 << OBJ_FILTER_CRYPT))
 
@@ -1361,6 +1407,13 @@ static void handle_pdfname(struct pdf_struct *pdf, struct pdf_obj *obj, const ch
         }
     }
 
+    if (escapes) {
+        /* if a commonly used PDF name is escaped that is certainly
+           suspicious. */
+        cli_dbgmsg("cli_pdf: pdfname %s is escaped\n", pdfname);
+        pdfobj_flag(pdf, obj, ESCAPED_COMMON_PDFNAME);
+    }
+
     if (!act) {
         /* these are digital signature objects, filter doesn't matter,
          * we don't need them anyway */
@@ -1372,15 +1425,10 @@ static void handle_pdfname(struct pdf_struct *pdf, struct pdf_obj *obj, const ch
         return;
     }
 
+#if HAVE_JSON
     if ((act->pdf_stats_cb))
         act->pdf_stats_cb(pdf, obj, act);
-
-    if (escapes) {
-        /* if a commonly used PDF name is escaped that is certainly
-           suspicious. */
-        cli_dbgmsg("cli_pdf: pdfname %s is escaped\n", pdfname);
-        pdfobj_flag(pdf, obj, ESCAPED_COMMON_PDFNAME);
-    }
+#endif
 
     if (act->from_state == *state || act->from_state == STATE_ANY) {
         *state = act->to_state;
@@ -1669,8 +1717,6 @@ void pdf_parseobj(struct pdf_struct *pdf, struct pdf_obj *obj)
             objstate = STATE_NONE;
             trailer_end = pdf_readint(dict, full_dict_length, "/H");
             if (trailer_end > 0 && trailer_end < pdf->size) {
-                const char *enc;
-
                 trailer = trailer_end - 1024;
                 if (trailer < 0)
                     trailer = 0;
@@ -2019,6 +2065,8 @@ static void check_user_password(struct pdf_struct *pdf, int R, const char *O,
     struct arc4_state arc4;
     unsigned password_empty = 0;
 
+    UNUSEDPARAM(oulen);
+
     dbg_printhex("U: ", U, 32);
     dbg_printhex("O: ", O, 32);
     if (R == 5) {
@@ -2027,7 +2075,7 @@ static void check_user_password(struct pdf_struct *pdf, int R, const char *O,
         /* supplement to ISO3200, 3.5.2 Algorithm 3.11 */
         /* user validation salt */
         cl_sha256(U+32, 8, result2, NULL);
-        dbg_printhex("Computed U", result2, 32);
+        dbg_printhex("Computed U", (const char *)result2, 32);
         if (!memcmp(result2, U, 32)) {
             off_t n;
 
@@ -2046,7 +2094,7 @@ static void check_user_password(struct pdf_struct *pdf, int R, const char *O,
                     return;
                 }
 
-                aes_decrypt(UE, &n, pdf->key, result2, 32, 0);
+                aes_decrypt((const unsigned char *)UE, &n, (unsigned char *)(pdf->key), (char *)result2, 32, 0);
                 dbg_printhex("cli_pdf: Candidate encryption key", pdf->key, pdf->keylen);
             }
         }
@@ -2089,15 +2137,15 @@ static void check_user_password(struct pdf_struct *pdf, int R, const char *O,
             return;
 
         memcpy(pdf->key, result, pdf->keylen);
-        dbg_printhex("md5", result, 16);
+        dbg_printhex("md5", (const char *)result, 16);
         dbg_printhex("Candidate encryption key", pdf->key, pdf->keylen);
 
         /* 7.6.3.3 Algorithm 6 */
         if (R == 2) {
             /* 7.6.3.3 Algorithm 4 */
             memcpy(data, key_padding, 32);
-            arc4_init(&arc4, pdf->key, pdf->keylen);
-            arc4_apply(&arc4, data, 32);
+            arc4_init(&arc4, (const uint8_t *)(pdf->key), pdf->keylen);
+            arc4_apply(&arc4, (uint8_t *)data, 32);
             dbg_printhex("computed U (R2)", data, 32);
             if (!memcmp(data, U, 32))
                 password_empty = 1;
@@ -2115,7 +2163,7 @@ static void check_user_password(struct pdf_struct *pdf, int R, const char *O,
             cl_hash_data("md5", d, 32 + pdf->fileIDlen, result, NULL);
             memcpy(data, pdf->key, len);
 
-            arc4_init(&arc4, data, len);
+            arc4_init(&arc4, (const uint8_t *)data, len);
             arc4_apply(&arc4, result, 16);
             for (i=1;i<=19;i++) {
                 unsigned j;
@@ -2123,12 +2171,12 @@ static void check_user_password(struct pdf_struct *pdf, int R, const char *O,
                 for (j=0;j<len;j++)
                     data[j] = pdf->key[j] ^ i;
 
-                arc4_init(&arc4, data, len);
+                arc4_init(&arc4, (const uint8_t *)data, len);
                 arc4_apply(&arc4, result, 16);
             }
 
             dbg_printhex("fileID", pdf->fileID, pdf->fileIDlen);
-            dbg_printhex("computed U (R>=3)", result, 16);
+            dbg_printhex("computed U (R>=3)", (const char *)result, 16);
             if (!memcmp(result, U, 16))
                 password_empty = 1;
         } else {
@@ -2168,7 +2216,7 @@ static enum enc_method parse_enc_method(const char *dict, unsigned len, const ch
     if (!strcmp(key, "Identity"))
         return ENC_IDENTITY;
 
-    q = pdf_getdict(dict, &len, key);
+    q = pdf_getdict(dict, (int *)(&len), key);
     if (!q)
         return def;
 
@@ -2193,7 +2241,7 @@ static enum enc_method parse_enc_method(const char *dict, unsigned len, const ch
 static void pdf_handle_enc(struct pdf_struct *pdf)
 {
     struct pdf_obj *obj;
-    uint32_t len, required_flags, n, R, P, length, EM = 1, i, oulen;
+    uint32_t len, n, R, P, length, EM = 1, i, oulen;
     char *O, *U, *UE, *StmF, *StrF, *EFF;
     const char *q, *q2;
 
@@ -2276,7 +2324,7 @@ static void pdf_handle_enc(struct pdf_struct *pdf)
             StrF = pdf_readval(q, len, "/StrF");
             EFF = pdf_readval(q, len, "/EFF");
             n = len;
-            pdf->CF = pdf_getdict(q, &n, "/CF");
+            pdf->CF = pdf_getdict(q, (int *)(&n), "/CF");
             pdf->CF_n = n;
 
             if (StmF)
@@ -2406,7 +2454,9 @@ int cli_pdf(const char *dir, cli_ctx *ctx, off_t offset)
     if (!pdfver) {
         cli_dbgmsg("cli_pdf: no PDF- header found\n");
         noisy_warnmsg("cli_pdf: no PDF- header found\n");
+#if HAVE_JSON
         pdf_export_json(&pdf);
+#endif
         return CL_SUCCESS;
     }
 
@@ -2457,7 +2507,9 @@ int cli_pdf(const char *dir, cli_ctx *ctx, off_t offset)
     eofmap = fmap_need_off_once(map, map_off, bytesleft);
     if (!eofmap) {
         cli_errmsg("cli_pdf: mmap() failed (2)\n");
+#if HAVE_JSON
         pdf_export_json(&pdf);
+#endif
         return CL_EMAP;
     }
 
@@ -2520,7 +2572,9 @@ int cli_pdf(const char *dir, cli_ctx *ctx, off_t offset)
     pdf.map = fmap_need_off(map, offset, size);
     if (!pdf.map) {
         cli_errmsg("cli_pdf: mmap() failed (3)\n");
+#if HAVE_JSON
         pdf_export_json(&pdf);
+#endif
         return CL_EMAP;
     }
 
@@ -2533,7 +2587,9 @@ int cli_pdf(const char *dir, cli_ctx *ctx, off_t offset)
         rc = CL_CLEAN;
     } else if (rc) {
         cli_dbgmsg("cli_pdf: (pre hooks) returning %d\n", rc);
+#if HAVE_JSON
         pdf_export_json(&pdf);
+#endif
         return rc == CL_BREAK ? CL_CLEAN : rc;
     }
 
@@ -2556,7 +2612,9 @@ int cli_pdf(const char *dir, cli_ctx *ctx, off_t offset)
 
         if (cli_checktimelimit(ctx) != CL_SUCCESS) {
             cli_errmsg("Timeout reached in the PDF parser\n");
+#if HAVE_JSON
             pdf_export_json(&pdf);
+#endif
             free(pdf.objs);
             if (pdf.fileID)
                 free(pdf.fileID);
@@ -2603,7 +2661,9 @@ int cli_pdf(const char *dir, cli_ctx *ctx, off_t offset)
 
         if (cli_checktimelimit(ctx) != CL_SUCCESS) {
             cli_errmsg("Timeout reached in the PDF parser\n");
+#if HAVE_JSON
             pdf_export_json(&pdf);
+#endif
             free(pdf.objs);
             if (pdf.fileID)
                 free(pdf.fileID);
@@ -2675,7 +2735,9 @@ int cli_pdf(const char *dir, cli_ctx *ctx, off_t offset)
         rc = CL_EFORMAT;
     }
 
+#if HAVE_JSON
     pdf_export_json(&pdf);
+#endif
 
     cli_dbgmsg("cli_pdf: returning %d\n", rc);
     free(pdf.objs);
@@ -2866,74 +2928,117 @@ pdf_nextobject(const char *ptr, size_t len)
 }
 
 /* PDF statistics */
+#if HAVE_JSON
 static void ASCIIHexDecode_cb(struct pdf_struct *pdf, struct pdf_obj *obj, struct pdfname_action *act)
 {
+    UNUSEDPARAM(obj);
+    UNUSEDPARAM(act);
+
     if (!(pdf))
         return;
 
     pdf->stats.nasciihexdecode++;
 }
+#endif
 
+#if HAVE_JSON
 static void ASCII85Decode_cb(struct pdf_struct *pdf, struct pdf_obj *obj, struct pdfname_action *act)
 {
+    UNUSEDPARAM(obj);
+    UNUSEDPARAM(act);
+
     if (!(pdf))
         return;
 
     pdf->stats.nascii85decode++;
 }
+#endif
 
+#if HAVE_JSON
 static void EmbeddedFile_cb(struct pdf_struct *pdf, struct pdf_obj *obj, struct pdfname_action *act)
 {
+    UNUSEDPARAM(obj);
+    UNUSEDPARAM(act);
+
     if (!(pdf))
         return;
 
     pdf->stats.nembeddedfile++;
 }
+#endif
 
+#if HAVE_JSON
 static void FlateDecode_cb(struct pdf_struct *pdf, struct pdf_obj *obj, struct pdfname_action *act)
 {
+    UNUSEDPARAM(obj);
+    UNUSEDPARAM(act);
+
     if (!(pdf))
         return;
 
     pdf->stats.nflate++;
 }
+#endif
 
+#if HAVE_JSON
 static void Image_cb(struct pdf_struct *pdf, struct pdf_obj *obj, struct pdfname_action *act)
 {
+    UNUSEDPARAM(obj);
+    UNUSEDPARAM(act);
+
     if (!(pdf))
         return;
 
     pdf->stats.nimage++;
 }
+#endif
 
+#if HAVE_JSON
 static void LZWDecode_cb(struct pdf_struct *pdf, struct pdf_obj *obj, struct pdfname_action *act)
 {
+    UNUSEDPARAM(obj);
+    UNUSEDPARAM(act);
+
     if (!(pdf))
         return;
 
     pdf->stats.nlzw++;
 }
+#endif
 
+#if HAVE_JSON
 static void RunLengthDecode_cb(struct pdf_struct *pdf, struct pdf_obj *obj, struct pdfname_action *act)
 {
+    UNUSEDPARAM(obj);
+    UNUSEDPARAM(act);
+
     if (!(pdf))
         return;
 
     pdf->stats.nrunlengthdecode++;
 }
+#endif
 
+#if HAVE_JSON
 static void CCITTFaxDecode_cb(struct pdf_struct *pdf, struct pdf_obj *obj, struct pdfname_action *act)
 {
+    UNUSEDPARAM(obj);
+    UNUSEDPARAM(act);
+
     if (!(pdf))
         return;
 
     pdf->stats.nfaxdecode++;
 }
+#endif
 
+#if HAVE_JSON
 static void JBIG2Decode_cb(struct pdf_struct *pdf, struct pdf_obj *obj, struct pdfname_action *act)
 {
-#if HAVE_JSON
-    struct json_object *pdfobj, *jbig2arr, *jbig2obj;
+    struct json_object *pdfobj, *jbig2arr;
+
+    UNUSEDPARAM(obj);
+    UNUSEDPARAM(act);
 
     if (!(pdf))
         return;
@@ -2955,53 +3060,80 @@ static void JBIG2Decode_cb(struct pdf_struct *pdf, struct pdf_obj *obj, struct p
     cli_jsonint_array(jbig2arr, obj->id>>8);
 
     pdf->stats.njbig2decode++;
-#endif
 }
+#endif
 
+#if HAVE_JSON
 static void DCTDecode_cb(struct pdf_struct *pdf, struct pdf_obj *obj, struct pdfname_action *act)
 {
+    UNUSEDPARAM(obj);
+    UNUSEDPARAM(act);
+
     if (!(pdf))
         return;
 
     pdf->stats.ndctdecode++;
 }
+#endif
 
+#if HAVE_JSON
 static void JPXDecode_cb(struct pdf_struct *pdf, struct pdf_obj *obj, struct pdfname_action *act)
 {
+    UNUSEDPARAM(obj);
+    UNUSEDPARAM(act);
+
     if (!(pdf))
         return;
 
     pdf->stats.njpxdecode++;
 }
+#endif
 
+#if HAVE_JSON
 static void Crypt_cb(struct pdf_struct *pdf, struct pdf_obj *obj, struct pdfname_action *act)
 {
+    UNUSEDPARAM(obj);
+    UNUSEDPARAM(act);
+
     if (!(pdf))
         return;
 
     pdf->stats.ncrypt++;
 }
+#endif
 
+#if HAVE_JSON
 static void Standard_cb(struct pdf_struct *pdf, struct pdf_obj *obj, struct pdfname_action *act)
 {
+    UNUSEDPARAM(obj);
+    UNUSEDPARAM(act);
+
     if (!(pdf))
         return;
 
     pdf->stats.nstandard++;
 }
+#endif
 
+#if HAVE_JSON
 static void Sig_cb(struct pdf_struct *pdf, struct pdf_obj *obj, struct pdfname_action *act)
 {
+    UNUSEDPARAM(obj);
+    UNUSEDPARAM(act);
+
     if (!(pdf))
         return;
 
     pdf->stats.nsigned++;
 }
+#endif
 
+#if HAVE_JSON
 static void JavaScript_cb(struct pdf_struct *pdf, struct pdf_obj *obj, struct pdfname_action *act)
 {
-#if HAVE_JSON
-    struct json_object *pdfobj, *jbig2arr, *jbig2obj;
+    struct json_object *pdfobj, *jbig2arr;
+
+    UNUSEDPARAM(act);
 
     if (!(pdf))
         return;
@@ -3023,36 +3155,53 @@ static void JavaScript_cb(struct pdf_struct *pdf, struct pdf_obj *obj, struct pd
     cli_jsonint_array(jbig2arr, obj->id>>8);
 
     pdf->stats.njs++;
-#endif
 }
+#endif
 
+#if HAVE_JSON
 static void OpenAction_cb(struct pdf_struct *pdf, struct pdf_obj *obj, struct pdfname_action *act)
 {
+    UNUSEDPARAM(obj);
+    UNUSEDPARAM(act);
+
     if (!(pdf))
         return;
 
     pdf->stats.nopenaction++;
 }
+#endif
 
+#if HAVE_JSON
 static void Launch_cb(struct pdf_struct *pdf, struct pdf_obj *obj, struct pdfname_action *act)
 {
+    UNUSEDPARAM(obj);
+    UNUSEDPARAM(act);
+
     if (!(pdf))
         return;
 
     pdf->stats.nlaunch++;
 }
+#endif
 
+#if HAVE_JSON
 static void Page_cb(struct pdf_struct *pdf, struct pdf_obj *obj, struct pdfname_action *act)
 {
+    UNUSEDPARAM(obj);
+    UNUSEDPARAM(act);
+
     if (!(pdf))
         return;
 
     pdf->stats.npage++;
 }
+#endif
 
+#if HAVE_JSON
 static void Author_cb(struct pdf_struct *pdf, struct pdf_obj *obj, struct pdfname_action *act)
 {
-#if HAVE_JSON
+    UNUSEDPARAM(act);
+
     if (!(pdf))
         return;
 
@@ -3061,12 +3210,14 @@ static void Author_cb(struct pdf_struct *pdf, struct pdf_obj *obj, struct pdfnam
 
     if (!(pdf->stats.author))
         pdf->stats.author = pdf_parse_string(pdf, obj, obj->start + pdf->map, obj_size(pdf, obj, 1), "/Author", NULL);
-#endif
 }
+#endif
 
+#if HAVE_JSON
 static void Creator_cb(struct pdf_struct *pdf, struct pdf_obj *obj, struct pdfname_action *act)
 {
-#if HAVE_JSON
+    UNUSEDPARAM(act);
+
     if (!(pdf))
         return;
 
@@ -3075,12 +3226,14 @@ static void Creator_cb(struct pdf_struct *pdf, struct pdf_obj *obj, struct pdfna
 
     if (!(pdf->stats.creator))
         pdf->stats.creator = pdf_parse_string(pdf, obj, obj->start + pdf->map, obj_size(pdf, obj, 1), "/Creator", NULL);
-#endif
 }
+#endif
 
+#if HAVE_JSON
 static void ModificationDate_cb(struct pdf_struct *pdf, struct pdf_obj *obj, struct pdfname_action *act)
 {
-#if HAVE_JSON
+    UNUSEDPARAM(act);
+
     if (!(pdf))
         return;
 
@@ -3089,12 +3242,14 @@ static void ModificationDate_cb(struct pdf_struct *pdf, struct pdf_obj *obj, str
 
     if (!(pdf->stats.modificationdate))
         pdf->stats.modificationdate = pdf_parse_string(pdf, obj, obj->start + pdf->map, obj_size(pdf, obj, 1), "/ModDate", NULL);
-#endif
 }
+#endif
 
+#if HAVE_JSON
 static void CreationDate_cb(struct pdf_struct *pdf, struct pdf_obj *obj, struct pdfname_action *act)
 {
-#if HAVE_JSON
+    UNUSEDPARAM(act);
+
     if (!(pdf))
         return;
 
@@ -3103,12 +3258,14 @@ static void CreationDate_cb(struct pdf_struct *pdf, struct pdf_obj *obj, struct 
 
     if (!(pdf->stats.creationdate))
         pdf->stats.creationdate = pdf_parse_string(pdf, obj, obj->start + pdf->map, obj_size(pdf, obj, 1), "/CreationDate", NULL);
-#endif
 }
+#endif
 
+#if HAVE_JSON
 static void Producer_cb(struct pdf_struct *pdf, struct pdf_obj *obj, struct pdfname_action *act)
 {
-#if HAVE_JSON
+    UNUSEDPARAM(act);
+
     if (!(pdf))
         return;
 
@@ -3117,12 +3274,14 @@ static void Producer_cb(struct pdf_struct *pdf, struct pdf_obj *obj, struct pdfn
 
     if (!(pdf->stats.producer))
         pdf->stats.producer = pdf_parse_string(pdf, obj, obj->start + pdf->map, obj_size(pdf, obj, 1), "/Producer", NULL);
-#endif
 }
+#endif
 
+#if HAVE_JSON
 static void Title_cb(struct pdf_struct *pdf, struct pdf_obj *obj, struct pdfname_action *act)
 {
-#if HAVE_JSON
+    UNUSEDPARAM(act);
+
     if (!(pdf))
         return;
 
@@ -3131,12 +3290,14 @@ static void Title_cb(struct pdf_struct *pdf, struct pdf_obj *obj, struct pdfname
 
     if (!(pdf->stats.title))
         pdf->stats.title = pdf_parse_string(pdf, obj, obj->start + pdf->map, obj_size(pdf, obj, 1), "/Title", NULL);
-#endif
 }
+#endif
 
+#if HAVE_JSON
 static void Keywords_cb(struct pdf_struct *pdf, struct pdf_obj *obj, struct pdfname_action *act)
 {
-#if HAVE_JSON
+    UNUSEDPARAM(act);
+
     if (!(pdf))
         return;
 
@@ -3145,12 +3306,14 @@ static void Keywords_cb(struct pdf_struct *pdf, struct pdf_obj *obj, struct pdfn
 
     if (!(pdf->stats.keywords))
         pdf->stats.keywords = pdf_parse_string(pdf, obj, obj->start + pdf->map, obj_size(pdf, obj, 1), "/Keywords", NULL);
-#endif
 }
+#endif
 
+#if HAVE_JSON
 static void Subject_cb(struct pdf_struct *pdf, struct pdf_obj *obj, struct pdfname_action *act)
 {
-#if HAVE_JSON
+    UNUSEDPARAM(act);
+
     if (!(pdf))
         return;
 
@@ -3159,50 +3322,68 @@ static void Subject_cb(struct pdf_struct *pdf, struct pdf_obj *obj, struct pdfna
 
     if (!(pdf->stats.subject))
         pdf->stats.subject = pdf_parse_string(pdf, obj, obj->start + pdf->map, obj_size(pdf, obj, 1), "/Subject", NULL);
-#endif
 }
+#endif
 
+#if HAVE_JSON
 static void RichMedia_cb(struct pdf_struct *pdf, struct pdf_obj *obj, struct pdfname_action *act)
 {
+    UNUSEDPARAM(obj);
+    UNUSEDPARAM(act);
+
     if (!(pdf))
         return;
 
     pdf->stats.nrichmedia++;
 }
+#endif
 
+#if HAVE_JSON
 static void AcroForm_cb(struct pdf_struct *pdf, struct pdf_obj *obj, struct pdfname_action *act)
 {
+    UNUSEDPARAM(obj);
+    UNUSEDPARAM(act);
+
     if (!(pdf))
         return;
 
     pdf->stats.nacroform++;
 }
+#endif
 
+#if HAVE_JSON
 static void XFA_cb(struct pdf_struct *pdf, struct pdf_obj *obj, struct pdfname_action *act)
 {
+    UNUSEDPARAM(obj);
+    UNUSEDPARAM(act);
+
     if (!(pdf))
         return;
 
     pdf->stats.nxfa++;
 }
+#endif
 
+#if HAVE_JSON
 static void Pages_cb(struct pdf_struct *pdf, struct pdf_obj *obj, struct pdfname_action *act)
 {
-#if HAVE_JSON
     struct pdf_array *array;
     const char *objstart = (const char *)(obj->start + pdf->map);
     const char *begin;
-    unsigned int objsz = obj_size(pdf, obj, 1);
+    unsigned int objsz;
     unsigned long npages=0, count;
     struct pdf_array_node *node;
-    struct pdf_dict *dict;
     json_object *pdfobj;
+
+    UNUSEDPARAM(act);
 
     if (!(pdf) || !(pdf->ctx->wrkproperty))
         return;
 
     if (!(pdf->ctx->options & CL_SCAN_FILE_PROPERTIES))
         return;
+
+    objsz = obj_size(pdf, obj, 1);
 
     pdfobj = cli_jsonobj(pdf->ctx->wrkproperty, "PDFStats");
     if (!(pdfobj))
@@ -3214,7 +3395,7 @@ static void Pages_cb(struct pdf_struct *pdf, struct pdf_obj *obj, struct pdfname
 
     begin += 5;
 
-    array = pdf_parse_array(pdf, obj, objsz, begin, NULL);
+    array = pdf_parse_array(pdf, obj, objsz, (char *)begin, NULL);
     if (!(array)) {
         cli_jsonbool(pdfobj, "IncorrectPagesCount", 1);
         return;
@@ -3245,16 +3426,18 @@ static void Pages_cb(struct pdf_struct *pdf, struct pdf_obj *obj, struct pdfname
 
 cleanup:
     pdf_free_array(array);
-#endif
 }
+#endif
 
+#if HAVE_JSON
 static void Colors_cb(struct pdf_struct *pdf, struct pdf_obj *obj, struct pdfname_action *act)
 {
-#if HAVE_JSON
     json_object *colorsobj, *pdfobj;
     unsigned long ncolors;
     char *start, *p1;
-    size_t objsz = obj_size(pdf, obj, 1);
+    size_t objsz;
+
+    UNUSEDPARAM(act);
 
     if (!(pdf) || !(pdf->ctx) || !(pdf->ctx->wrkproperty))
         return;
@@ -3262,9 +3445,11 @@ static void Colors_cb(struct pdf_struct *pdf, struct pdf_obj *obj, struct pdfnam
     if (!(pdf->ctx->options & CL_SCAN_FILE_PROPERTIES))
         return;
 
-    start = obj->start + pdf->map;
+    objsz = obj_size(pdf, obj, 1);
 
-    p1 = cli_memstr(start, objsz, "/Colors", 7);
+    start = (char *)(obj->start + pdf->map);
+
+    p1 = (char *)cli_memstr(start, objsz, "/Colors", 7);
     if (!(p1))
         return;
 
@@ -3277,7 +3462,7 @@ static void Colors_cb(struct pdf_struct *pdf, struct pdf_obj *obj, struct pdfnam
     while (p1 - start < objsz && isspace(p1[0]))
         p1++;
 
-    if (p1 - start == objsz)
+    if ((size_t)(p1 - start) == objsz)
         return;
 
     ncolors = strtoul(p1, NULL, 10);
@@ -3295,12 +3480,12 @@ static void Colors_cb(struct pdf_struct *pdf, struct pdf_obj *obj, struct pdfnam
         return;
 
     cli_jsonint_array(colorsobj, obj->id>>8);
-#endif
 }
+#endif
 
+#if HAVE_JSON
 static void pdf_export_json(struct pdf_struct *pdf)
 {
-#if HAVE_JSON
     json_object *pdfobj;
     unsigned long i;
 
@@ -3452,5 +3637,5 @@ cleanup:
         free(pdf->stats.keywords);
         pdf->stats.keywords = NULL;
     }
-#endif
 }
+#endif
